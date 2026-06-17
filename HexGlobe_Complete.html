@@ -1,0 +1,2028 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hex Globe Framework v3.0 - Ocean Mask Toggle</title>
+    
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://unpkg.com/three@0.170.0/build/three.module.js"
+        }
+    }
+    </script>
+    
+    <script type="module">
+        import * as THREE from 'three';
+        window.THREE = THREE;
+        console.log('[Init] THREE loaded:', THREE.REVISION);
+    </script>
+    
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body>
+    <div id="root"></div>
+    
+    <script type="text/babel">
+const { useEffect, useRef, useState, useCallback } = React;
+
+
+// ============================================================================
+// CORE DATA STRUCTURES
+// ============================================================================
+
+class HexLocation {
+  constructor(id, position) {
+    this.id = id;
+    this.position = position;
+    this.neighbors = [];
+    this.terrain = 'ocean';
+    this.elevation = 0;
+    this.isOcean = false; // Ocean boundary mask (separate from elevation)
+    this.climate = 'temperate';
+    this.provinceId = null;
+  }
+
+  getLatitude() {
+    return Math.asin(this.position.y) * (180 / Math.PI);
+  }
+}
+
+class Province {
+  constructor(id, name = '') {
+    this.id = id;
+    this.name = name || `Province ${id}`;
+    this.locationIds = [];
+    this.color = `hsl(${Math.random() * 360}, ${60 + Math.random() * 20}%, ${45 + Math.random() * 15}%)`;
+  }
+}
+
+class HexGrid {
+  constructor(subdivisions = 5) {
+    this.subdivisions = subdivisions;
+    this.locations = new Map();
+    this.provinces = new Map();
+    this.nextLocationId = 0;
+    this.nextProvinceId = 0;
+  }
+
+  generate() {
+    console.log(`[HexGrid] Generating vertex-centered grid with subdivision ${this.subdivisions}`);
+    
+    // Try THREE.IcosahedronGeometry first, but fall back to custom if it fails
+    let positions;
+    let geometry;
+    
+    try {
+      geometry = new THREE.IcosahedronGeometry(1, this.subdivisions);
+      positions = geometry.attributes.position;
+      
+      const expected = 10 * (4 ** this.subdivisions) + 2;
+      if (positions.count < expected * 0.9) {
+        console.warn(`[HexGrid] THREE.IcosahedronGeometry only created ${positions.count} vertices, expected ${expected}`);
+        console.warn(`[HexGrid] Falling back to custom subdivider...`);
+        geometry.dispose();
+        geometry = this._generateCustomIcosahedron(this.subdivisions);
+        positions = geometry.attributes.position;
+      } else {
+        console.log(`[HexGrid] Using THREE.IcosahedronGeometry: ${positions.count} vertices`);
+      }
+    } catch (e) {
+      console.warn(`[HexGrid] THREE.IcosahedronGeometry failed, using custom subdivider`);
+      geometry = this._generateCustomIcosahedron(this.subdivisions);
+      positions = geometry.attributes.position;
+    }
+    
+    console.log(`[HexGrid] Final geometry: ${positions.count} vertices for subdivision ${this.subdivisions}`);
+    
+    // Create location for each vertex
+    for (let i = 0; i < positions.count; i++) {
+      const location = new HexLocation(this.nextLocationId++, {
+        x: positions.getX(i),
+        y: positions.getY(i),
+        z: positions.getZ(i)
+      });
+      this.locations.set(location.id, location);
+    }
+
+    // Build neighbor relationships from triangle edges
+    const index = geometry.index;
+    if (index) {
+      const neighborMap = new Map();
+      for (let i = 0; i < index.count; i += 3) {
+        const [a, b, c] = [index.getX(i), index.getX(i + 1), index.getX(i + 2)];
+        this._addNeighbor(neighborMap, a, b);
+        this._addNeighbor(neighborMap, b, c);
+        this._addNeighbor(neighborMap, c, a);
+      }
+      neighborMap.forEach((neighbors, id) => {
+        const loc = this.locations.get(id);
+        if (loc) loc.neighbors = Array.from(neighbors);
+      });
+    }
+    
+    console.log(`[HexGrid] Generated ${this.locations.size} vertex-centered hexes`);
+    return this;
+  }
+
+  _generateCustomIcosahedron(subdivisions) {
+    console.log(`[HexGrid] Building custom icosahedron with ${subdivisions} subdivisions`);
+    
+    // Base icosahedron vertices (12 vertices)
+    const t = (1 + Math.sqrt(5)) / 2;
+    const vertices = [
+      [-1, t, 0], [1, t, 0], [-1, -t, 0], [1, -t, 0],
+      [0, -1, t], [0, 1, t], [0, -1, -t], [0, 1, -t],
+      [t, 0, -1], [t, 0, 1], [-t, 0, -1], [-t, 0, 1]
+    ].map(v => new THREE.Vector3(v[0], v[1], v[2]).normalize());
+    
+    // Base icosahedron faces (20 triangles)
+    const faces = [
+      [0, 11, 5], [0, 5, 1], [0, 1, 7], [0, 7, 10], [0, 10, 11],
+      [1, 5, 9], [5, 11, 4], [11, 10, 2], [10, 7, 6], [7, 1, 8],
+      [3, 9, 4], [3, 4, 2], [3, 2, 6], [3, 6, 8], [3, 8, 9],
+      [4, 9, 5], [2, 4, 11], [6, 2, 10], [8, 6, 7], [9, 8, 1]
+    ];
+    
+    // Subdivide faces
+    let currentVertices = vertices;
+    let currentFaces = faces;
+    
+    for (let i = 0; i < subdivisions; i++) {
+      const newFaces = [];
+      const midpointCache = new Map();
+      
+      const getMidpoint = (i1, i2) => {
+        const key = i1 < i2 ? `${i1},${i2}` : `${i2},${i1}`;
+        if (midpointCache.has(key)) return midpointCache.get(key);
+        
+        const v1 = currentVertices[i1];
+        const v2 = currentVertices[i2];
+        const mid = new THREE.Vector3()
+          .addVectors(v1, v2)
+          .multiplyScalar(0.5)
+          .normalize();
+        
+        const index = currentVertices.length;
+        currentVertices.push(mid);
+        midpointCache.set(key, index);
+        return index;
+      };
+      
+      // Subdivide each face into 4 sub-faces
+      for (const face of currentFaces) {
+        const [v1, v2, v3] = face;
+        const a = getMidpoint(v1, v2);
+        const b = getMidpoint(v2, v3);
+        const c = getMidpoint(v3, v1);
+        
+        newFaces.push([v1, a, c], [v2, b, a], [v3, c, b], [a, b, c]);
+      }
+      
+      currentFaces = newFaces;
+    }
+    
+    // Build THREE.BufferGeometry
+    const geometry = new THREE.BufferGeometry();
+    
+    // Vertex positions
+    const positionArray = new Float32Array(currentVertices.length * 3);
+    currentVertices.forEach((v, i) => {
+      positionArray[i * 3] = v.x;
+      positionArray[i * 3 + 1] = v.y;
+      positionArray[i * 3 + 2] = v.z;
+    });
+    geometry.setAttribute('position', new THREE.BufferAttribute(positionArray, 3));
+    
+    // Face indices
+    const indexArray = new Uint32Array(currentFaces.length * 3);
+    currentFaces.forEach((face, i) => {
+      indexArray[i * 3] = face[0];
+      indexArray[i * 3 + 1] = face[1];
+      indexArray[i * 3 + 2] = face[2];
+    });
+    geometry.setIndex(new THREE.BufferAttribute(indexArray, 1));
+    
+    console.log(`[HexGrid] Custom subdivider created ${currentVertices.length} vertices, ${currentFaces.length} faces`);
+    return geometry;
+  }
+
+  _addNeighbor(map, a, b) {
+    if (!map.has(a)) map.set(a, new Set());
+    if (!map.has(b)) map.set(b, new Set());
+    map.get(a).add(b);
+    map.get(b).add(a);
+  }
+
+  createProvince(name = '') {
+    const province = new Province(this.nextProvinceId++, name);
+    this.provinces.set(province.id, province);
+    return province;
+  }
+
+  assignToProvince(locationId, provinceId) {
+    const location = this.locations.get(locationId);
+    const province = this.provinces.get(provinceId);
+    if (location && province) {
+      if (location.provinceId !== null) {
+        const oldProvince = this.provinces.get(location.provinceId);
+        if (oldProvince) {
+          oldProvince.locationIds = oldProvince.locationIds.filter(id => id !== locationId);
+        }
+      }
+      location.provinceId = provinceId;
+      if (!province.locationIds.includes(locationId)) {
+        province.locationIds.push(locationId);
+      }
+    }
+  }
+
+  // Deep clone for React state updates
+  clone() {
+    const cloned = new HexGrid(this.subdivisions);
+    cloned.nextLocationId = this.nextLocationId;
+    cloned.nextProvinceId = this.nextProvinceId;
+    
+    // Clone locations
+    this.locations.forEach((loc, id) => {
+      const newLoc = new HexLocation(loc.id, { ...loc.position });
+      newLoc.neighbors = [...loc.neighbors];
+      newLoc.terrain = loc.terrain;
+      newLoc.elevation = loc.elevation;
+      newLoc.climate = loc.climate;
+      newLoc.provinceId = loc.provinceId;
+      cloned.locations.set(id, newLoc);
+    });
+    
+    // Clone provinces
+    this.provinces.forEach((prov, id) => {
+      const newProv = new Province(prov.id, prov.name);
+      newProv.locationIds = [...prov.locationIds];
+      newProv.color = prov.color;
+      cloned.provinces.set(id, newProv);
+    });
+    
+    return cloned;
+  }
+}
+
+// ============================================================================
+// TERRAIN GENERATOR
+// ============================================================================
+
+class TerrainGenerator {
+  static generateRandom(grid, seed = 12345) {
+    console.log(`[Terrain] Generating procedural terrain with seed ${seed}`);
+    const random = this._seededRandom(seed);
+    grid.locations.forEach(loc => {
+      const lat = loc.getLatitude();
+      const noise = random() * 0.3 + Math.sin(loc.position.x * 5) * 0.2 + Math.cos(loc.position.z * 5) * 0.2;
+      loc.elevation = noise;
+      
+      if (loc.elevation < -0.1) {
+        loc.terrain = 'ocean';
+      } else if (Math.abs(lat) > 60) {
+        loc.terrain = loc.elevation > 0.2 ? 'mountains' : 'tundra';
+      } else if (loc.elevation > 0.3) {
+        loc.terrain = 'mountains';
+      } else if (loc.elevation > 0.15) {
+        loc.terrain = 'hills';
+      } else {
+        loc.terrain = random() > 0.6 ? 'forest' : 'plains';
+      }
+    });
+    
+    const terrainCounts = {};
+    grid.locations.forEach(loc => terrainCounts[loc.terrain] = (terrainCounts[loc.terrain] || 0) + 1);
+    console.log('[Terrain] Distribution:');
+    Object.entries(terrainCounts).forEach(([t, c]) => 
+      console.log(`  ${t}: ${c} (${(c / grid.locations.size * 100).toFixed(1)}%)`)
+    );
+  }
+
+  static async loadFromHeightmap(grid, file, seaLevel = 0.01, debugMode = false) {
+    console.log(`[Terrain] Loading heightmap: ${file.name}, sea level: ${(seaLevel * 100).toFixed(1)}%`);
+    console.log(`[Terrain] Grid has ${grid.locations.size} locations before loading`);
+    
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        const img = new Image();
+        img.onload = () => {
+          const canvas = document.createElement('canvas');
+          canvas.width = img.width;
+          canvas.height = img.height;
+          const ctx = canvas.getContext('2d');
+          ctx.drawImage(img, 0, 0);
+          const imageData = ctx.getImageData(0, 0, img.width, img.height);
+          
+          this._applyHeightmap(grid, imageData, img.width, img.height, seaLevel, debugMode);
+          console.log(`[Terrain] Loaded ${img.width}x${img.height} heightmap successfully`);
+          resolve();
+        };
+        img.onerror = reject;
+        img.src = e.target.result;
+      };
+      reader.onerror = reject;
+      reader.readAsDataURL(file);
+    });
+  }
+
+  static async loadOceanMask(grid, file) {
+    console.log(`[Ocean] Loading ocean boundary mask: ${file.name}`);
+    
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        const img = new Image();
+        img.onload = () => {
+          const canvas = document.createElement('canvas');
+          canvas.width = img.width;
+          canvas.height = img.height;
+          const ctx = canvas.getContext('2d');
+          ctx.drawImage(img, 0, 0);
+          const imageData = ctx.getImageData(0, 0, img.width, img.height);
+          
+          // Apply ocean mask
+          grid.locations.forEach(loc => {
+            const lat = Math.asin(Math.max(-1, Math.min(1, loc.position.y))) * (180 / Math.PI);
+            const lon = Math.atan2(loc.position.z, loc.position.x) * (180 / Math.PI);
+            
+            const pixelX = Math.floor(((lon + 180) % 360) / 360 * img.width);
+            const pixelY = Math.floor((90 - lat) / 180 * img.height);
+            const x = Math.max(0, Math.min(img.width - 1, pixelX));
+            const y = Math.max(0, Math.min(img.height - 1, pixelY));
+            
+            const idx = (y * img.width + x) * 4;
+            const r = imageData.data[idx];
+            const g = imageData.data[idx + 1];
+            const b = imageData.data[idx + 2];
+            
+            // Pure white = ocean, anything else = land
+            // Using threshold of 250 to account for slight compression artifacts
+            const isWhite = r >= 250 && g >= 250 && b >= 250;
+            loc.isOcean = isWhite;
+          });
+          
+          const oceanCount = Array.from(grid.locations.values()).filter(loc => loc.isOcean).length;
+          console.log(`[Ocean] Loaded ${img.width}x${img.height} ocean mask: ${oceanCount} ocean hexes (${(oceanCount / grid.locations.size * 100).toFixed(1)}%)`);
+          resolve();
+        };
+        img.onerror = reject;
+        img.src = e.target.result;
+      };
+      reader.onerror = reject;
+      reader.readAsDataURL(file);
+    });
+  }
+
+  static _applyHeightmap(grid, imageData, width, height, seaLevel, debugMode) {
+    console.log(`[Terrain] Applying heightmap to grid with ${grid.locations.size} locations`);
+    
+    const elevations = [];
+    let min = Infinity, max = -Infinity;
+    
+    grid.locations.forEach(loc => {
+      const lat = Math.asin(Math.max(-1, Math.min(1, loc.position.y))) * (180 / Math.PI);
+      const lon = Math.atan2(loc.position.z, loc.position.x) * (180 / Math.PI);
+      
+      const pixelX = Math.floor(((lon + 180) % 360) / 360 * width);
+      const pixelY = Math.floor((90 - lat) / 180 * height);
+      const x = Math.max(0, Math.min(width - 1, pixelX));
+      const y = Math.max(0, Math.min(height - 1, pixelY));
+      
+      const idx = (y * width + x) * 4;
+      const gray = (imageData.data[idx] + imageData.data[idx + 1] + imageData.data[idx + 2]) / 3;
+      elevations.push({ loc, gray });
+      if (gray < min) min = gray;
+      if (gray > max) max = gray;
+    });
+    
+    const mostCommon = this._findMostCommon(elevations.map(e => Math.floor(e.gray)));
+    console.log(`[Terrain] Range: ${min.toFixed(0)}-${max.toFixed(0)}, Ocean value: ${mostCommon}, Sea level: ${(seaLevel * 100).toFixed(1)}%`);
+    
+    elevations.forEach(({ loc, gray }) => {
+      const normalized = (gray - min) / (max - min);
+      
+      if (debugMode) {
+        loc.terrain = gray <= mostCommon + 2 ? 'ocean' : 'desert';
+        loc.elevation = gray <= mostCommon + 2 ? 0.0 : 0.5;
+      } else {
+        // Use ocean mask if available, otherwise fall back to elevation threshold
+        const isOcean = loc.isOcean !== undefined && loc.isOcean !== false
+          ? loc.isOcean
+          : (seaLevel < 0.05 
+              ? gray <= mostCommon + (max - min) * seaLevel * 10
+              : normalized < seaLevel);
+        
+        if (isOcean) {
+          loc.terrain = 'ocean';
+          loc.elevation = 0.0; // Sea level
+          loc.isOcean = true;
+        } else {
+          // Land: remap to 0.1 - 1.0 range
+          const landRange = max - mostCommon;
+          const rawElevation = landRange > 0 ? (gray - mostCommon) / landRange : 0.5;
+          loc.elevation = 0.1 + (rawElevation * 0.9); // Map to 0.1-1.0
+          loc.isOcean = false;
+          const lat = loc.getLatitude();
+          
+          if (Math.abs(lat) > 60) {
+            loc.terrain = loc.elevation > 0.7 ? 'mountains' : 'tundra';
+          } else if (loc.elevation > 0.7) {
+            loc.terrain = 'mountains';
+          } else if (loc.elevation > 0.4) {
+            loc.terrain = 'hills';
+          } else if (Math.abs(lat) < 25) {
+            loc.terrain = 'desert';
+          } else {
+            loc.terrain = 'plains';
+          }
+        }
+      }
+    });
+    
+    const terrainCounts = {};
+    grid.locations.forEach(loc => terrainCounts[loc.terrain] = (terrainCounts[loc.terrain] || 0) + 1);
+    console.log('[Terrain] Distribution:');
+    Object.entries(terrainCounts).forEach(([t, c]) => 
+      console.log(`  ${t}: ${c} (${(c / grid.locations.size * 100).toFixed(1)}%)`)
+    );
+  }
+
+  static _findMostCommon(values) {
+    if (values.length === 0) {
+      console.error('[Terrain] _findMostCommon called with empty array');
+      return 0;
+    }
+    const counts = {};
+    values.forEach(v => counts[v] = (counts[v] || 0) + 1);
+    const entries = Object.entries(counts);
+    if (entries.length === 0) return 0;
+    return parseInt(entries.reduce((a, b) => b[1] > a[1] ? b : a)[0]);
+  }
+
+  static _seededRandom(seed) {
+    let state = seed;
+    return () => {
+      state = (state * 1664525 + 1013904223) % 4294967296;
+      return state / 4294967296;
+    };
+  }
+
+  static getTerrainColor(terrain) {
+    return {
+      ocean: '#1a4d7a',
+      plains: '#90c590',
+      hills: '#7a9b6a',
+      mountains: '#8b7d6b',
+      forest: '#2d5a2d',
+      desert: '#d4c59e',
+      tundra: '#d4e6e6'
+    }[terrain] || '#888888';
+  }
+}
+
+// ============================================================================
+// PROVINCE GENERATOR
+// ============================================================================
+
+class ProvinceGenerator {
+  static generate(grid, count = 20, seed = 12345) {
+    console.log(`[Provinces] Generating ${count} provinces with seed ${seed}`);
+    const random = this._seededRandom(seed);
+    const land = Array.from(grid.locations.values()).filter(l => l.terrain !== 'ocean');
+    const unassigned = new Set(land.map(l => l.id));
+    
+    // Clear existing provinces
+    grid.provinces.clear();
+    grid.locations.forEach(loc => loc.provinceId = null);
+    grid.nextProvinceId = 0;
+    
+    for (let i = 0; i < count && unassigned.size > 0; i++) {
+      const province = grid.createProvince();
+      const available = land.filter(l => unassigned.has(l.id));
+      if (available.length === 0) break;
+      
+      const seed = available[Math.floor(random() * available.length)];
+      const targetSize = Math.floor(land.length / count);
+      const queue = [seed.id];
+      const visited = new Set();
+      
+      while (queue.length > 0 && province.locationIds.length < targetSize) {
+        const locId = queue.shift();
+        if (visited.has(locId) || !unassigned.has(locId)) continue;
+        
+        const loc = grid.locations.get(locId);
+        if (!loc || loc.terrain === 'ocean') continue;
+        
+        grid.assignToProvince(locId, province.id);
+        unassigned.delete(locId);
+        visited.add(locId);
+        
+        loc.neighbors.forEach(nId => {
+          const n = grid.locations.get(nId);
+          if (n && n.terrain !== 'ocean' && !visited.has(nId)) queue.push(nId);
+        });
+      }
+    }
+    
+    // Assign orphans
+    unassigned.forEach(locId => {
+      const loc = grid.locations.get(locId);
+      if (!loc || loc.terrain === 'ocean') return;
+      for (const nId of loc.neighbors) {
+        const n = grid.locations.get(nId);
+        if (n && n.provinceId !== null) {
+          grid.assignToProvince(locId, n.provinceId);
+          break;
+        }
+      }
+    });
+    
+    console.log(`[Provinces] Created ${grid.provinces.size} provinces`);
+  }
+
+  static _seededRandom(seed) {
+    let state = seed;
+    return () => {
+      state = (state * 1664525 + 1013904223) % 4294967296;
+      return state / 4294967296;
+    };
+  }
+}
+
+// ============================================================================
+// HEX RENDERER (ULTRA-OPTIMIZED VERTEX-CENTERED WITH MASSIVE BATCHING)
+// ============================================================================
+
+class HexRenderer {
+  static renderHexagons(grid, scene, mapMode) {
+    console.log(`[Renderer] ULTRA-OPTIMIZED rendering ${grid.locations.size} vertex-centered hexagons`);
+    const startTime = performance.now();
+    
+    // Use same geometry generation logic as HexGrid
+    let geometry;
+    try {
+      geometry = new THREE.IcosahedronGeometry(1, grid.subdivisions);
+      const expected = 10 * (4 ** grid.subdivisions) + 2;
+      
+      if (geometry.attributes.position.count < expected * 0.9) {
+        console.warn(`[Renderer] THREE.IcosahedronGeometry failed, using custom subdivider`);
+        geometry.dispose();
+        geometry = this._generateCustomIcosahedron(grid.subdivisions);
+      }
+    } catch (e) {
+      console.warn(`[Renderer] THREE.IcosahedronGeometry error, using custom subdivider`);
+      geometry = this._generateCustomIcosahedron(grid.subdivisions);
+    }
+    
+    const positions = geometry.attributes.position;
+    let index = geometry.index;
+    
+    if (!index) {
+      const indices = [];
+      for (let i = 0; i < positions.count; i++) indices.push(i);
+      geometry.setIndex(indices);
+      index = geometry.index;
+    }
+    
+    if (!index) {
+      console.error('[Renderer] Failed to create index');
+      return 0;
+    }
+    
+    // Build face centers (only once)
+    const faceCount = index.count / 3;
+    const faceCenters = new Array(faceCount);
+    for (let i = 0; i < faceCount; i++) {
+      const idx = i * 3;
+      const [a, b, c] = [index.getX(idx), index.getX(idx + 1), index.getX(idx + 2)];
+      faceCenters[i] = new THREE.Vector3(
+        (positions.getX(a) + positions.getX(b) + positions.getX(c)) / 3,
+        (positions.getY(a) + positions.getY(b) + positions.getY(c)) / 3,
+        (positions.getZ(a) + positions.getZ(b) + positions.getZ(c)) / 3
+      ).normalize().multiplyScalar(1.002);
+    }
+    
+    // Build vertex to faces mapping
+    const vertexToFaces = new Map();
+    for (let i = 0; i < faceCount; i++) {
+      const idx = i * 3;
+      [index.getX(idx), index.getX(idx + 1), index.getX(idx + 2)].forEach(v => {
+        if (!vertexToFaces.has(v)) vertexToFaces.set(v, []);
+        vertexToFaces.get(v).push(i);
+      });
+    }
+    
+    // Merge duplicate vertices and track original vertex IDs
+    const positionMap = new Map();
+    const mergedPos = [];
+    const vertexMapping = new Array(positions.count);
+    const mergedIdToOriginalId = new Map(); // Track which original vertex each merged vertex came from
+    
+    for (let i = 0; i < positions.count; i++) {
+      const key = `${positions.getX(i).toFixed(6)},${positions.getY(i).toFixed(6)},${positions.getZ(i).toFixed(6)}`;
+      if (positionMap.has(key)) {
+        vertexMapping[i] = positionMap.get(key);
+      } else {
+        const newIdx = mergedPos.length;
+        mergedPos.push(new THREE.Vector3(positions.getX(i), positions.getY(i), positions.getZ(i)));
+        positionMap.set(key, newIdx);
+        vertexMapping[i] = newIdx;
+        mergedIdToOriginalId.set(newIdx, i); // Remember the first original vertex for this merged vertex
+      }
+    }
+    
+    // Build merged vertex to faces mapping
+    const mergedVertexToFaces = new Map();
+    for (let i = 0; i < faceCount; i++) {
+      const idx = i * 3;
+      [vertexMapping[index.getX(idx)], vertexMapping[index.getX(idx + 1)], vertexMapping[index.getX(idx + 2)]].forEach(v => {
+        if (!mergedVertexToFaces.has(v)) mergedVertexToFaces.set(v, []);
+        if (!mergedVertexToFaces.get(v).includes(i)) mergedVertexToFaces.get(v).push(i);
+      });
+    }
+    
+    // Group hexes by color for massive batching
+    const hexesByColor = new Map();
+    let hexCount = 0;
+    
+    mergedVertexToFaces.forEach((faceIndices, mergedIdx) => {
+      if (faceIndices.length < 3) return;
+      
+      // Get the original vertex ID for this merged vertex
+      const originalVertexId = mergedIdToOriginalId.get(mergedIdx);
+      const loc = grid.locations.get(originalVertexId);
+      if (!loc) return;
+      
+      // Determine color
+      let colorStr;
+      if (mapMode === 'terrain') {
+        colorStr = TerrainGenerator.getTerrainColor(loc.terrain);
+      } else if (mapMode === 'political') {
+        const prov = loc.provinceId !== null ? grid.provinces.get(loc.provinceId) : null;
+        colorStr = prov ? prov.color : '#1a4d7a';
+      } else {
+        const e = (loc.elevation + 0.5) / 1.5;
+        colorStr = `rgb(${Math.floor(e*204)}, ${Math.floor(e*153)}, ${Math.floor(e*102)})`;
+      }
+      
+      if (!hexesByColor.has(colorStr)) {
+        hexesByColor.set(colorStr, []);
+      }
+      
+      // Build hex geometry
+      const center = mergedPos[mergedIdx].clone().normalize().multiplyScalar(1.002);
+      const cellVerts = faceIndices.map(fi => faceCenters[fi]);
+      
+      // Sort vertices around center
+      const normal = center.clone().normalize();
+      const ref = Math.abs(normal.y) < 0.9 ? new THREE.Vector3(0, 1, 0) : new THREE.Vector3(1, 0, 0);
+      const tangent = ref.clone().cross(normal).normalize();
+      const bitangent = normal.clone().cross(tangent);
+      
+      cellVerts.sort((a, b) => {
+        const vA = a.clone().sub(center);
+        const vB = b.clone().sub(center);
+        return Math.atan2(vA.dot(bitangent), vA.dot(tangent)) - Math.atan2(vB.dot(bitangent), vB.dot(tangent));
+      });
+      
+      hexesByColor.get(colorStr).push({ cellVerts });
+      hexCount++;
+    });
+    
+    console.log(`[Renderer] Built ${hexCount} hexagons, merging into ${hexesByColor.size} batches...`);
+    
+    // Create massive merged geometries per color (ULTRA OPTIMIZED)
+    let meshCount = 0;
+    hexesByColor.forEach((hexes, colorStr) => {
+      // Pre-calculate total size
+      let totalVerts = 0;
+      let totalIndices = 0;
+      hexes.forEach(hex => {
+        totalVerts += hex.cellVerts.length;
+        totalIndices += (hex.cellVerts.length - 2) * 3;
+      });
+      
+      // Pre-allocate arrays (much faster than push)
+      const vertices = new Float32Array(totalVerts * 3);
+      const indices = new Uint32Array(totalIndices);
+      
+      let vertOffset = 0;
+      let idxOffset = 0;
+      let vertCount = 0;
+      
+      hexes.forEach(hex => {
+        const verts = hex.cellVerts;
+        
+        // Copy vertices
+        for (let i = 0; i < verts.length; i++) {
+          vertices[vertOffset++] = verts[i].x;
+          vertices[vertOffset++] = verts[i].y;
+          vertices[vertOffset++] = verts[i].z;
+        }
+        
+        // Build indices (fan triangulation)
+        for (let i = 1; i < verts.length - 1; i++) {
+          indices[idxOffset++] = vertCount;
+          indices[idxOffset++] = vertCount + i;
+          indices[idxOffset++] = vertCount + i + 1;
+        }
+        
+        vertCount += verts.length;
+      });
+      
+      // Create merged geometry
+      const mergedGeo = new THREE.BufferGeometry();
+      mergedGeo.setAttribute('position', new THREE.BufferAttribute(vertices, 3));
+      mergedGeo.setIndex(new THREE.BufferAttribute(indices, 1));
+      mergedGeo.computeVertexNormals();
+      
+      const mesh = new THREE.Mesh(
+        mergedGeo, 
+        new THREE.MeshBasicMaterial({ color: colorStr, side: THREE.DoubleSide })
+      );
+      scene.add(mesh);
+      meshCount++;
+    });
+    
+    const elapsed = performance.now() - startTime;
+    console.log(`[Renderer] ✓ ${hexCount} hexagons merged into ${meshCount} meshes in ${elapsed.toFixed(1)}ms (${(hexCount / elapsed * 1000).toFixed(0)} hexes/sec)`);
+    return hexCount;
+  }
+
+  static _generateCustomIcosahedron(subdivisions) {
+    // Same custom subdivider as in HexGrid
+    const t = (1 + Math.sqrt(5)) / 2;
+    const vertices = [
+      [-1, t, 0], [1, t, 0], [-1, -t, 0], [1, -t, 0],
+      [0, -1, t], [0, 1, t], [0, -1, -t], [0, 1, -t],
+      [t, 0, -1], [t, 0, 1], [-t, 0, -1], [-t, 0, 1]
+    ].map(v => new THREE.Vector3(v[0], v[1], v[2]).normalize());
+    
+    const faces = [
+      [0, 11, 5], [0, 5, 1], [0, 1, 7], [0, 7, 10], [0, 10, 11],
+      [1, 5, 9], [5, 11, 4], [11, 10, 2], [10, 7, 6], [7, 1, 8],
+      [3, 9, 4], [3, 4, 2], [3, 2, 6], [3, 6, 8], [3, 8, 9],
+      [4, 9, 5], [2, 4, 11], [6, 2, 10], [8, 6, 7], [9, 8, 1]
+    ];
+    
+    let currentVertices = vertices;
+    let currentFaces = faces;
+    
+    for (let i = 0; i < subdivisions; i++) {
+      const newFaces = [];
+      const midpointCache = new Map();
+      
+      const getMidpoint = (i1, i2) => {
+        const key = i1 < i2 ? `${i1},${i2}` : `${i2},${i1}`;
+        if (midpointCache.has(key)) return midpointCache.get(key);
+        
+        const v1 = currentVertices[i1];
+        const v2 = currentVertices[i2];
+        const mid = new THREE.Vector3()
+          .addVectors(v1, v2)
+          .multiplyScalar(0.5)
+          .normalize();
+        
+        const index = currentVertices.length;
+        currentVertices.push(mid);
+        midpointCache.set(key, index);
+        return index;
+      };
+      
+      for (const face of currentFaces) {
+        const [v1, v2, v3] = face;
+        const a = getMidpoint(v1, v2);
+        const b = getMidpoint(v2, v3);
+        const c = getMidpoint(v3, v1);
+        
+        newFaces.push([v1, a, c], [v2, b, a], [v3, c, b], [a, b, c]);
+      }
+      
+      currentFaces = newFaces;
+    }
+    
+    const geometry = new THREE.BufferGeometry();
+    
+    const positionArray = new Float32Array(currentVertices.length * 3);
+    currentVertices.forEach((v, i) => {
+      positionArray[i * 3] = v.x;
+      positionArray[i * 3 + 1] = v.y;
+      positionArray[i * 3 + 2] = v.z;
+    });
+    geometry.setAttribute('position', new THREE.BufferAttribute(positionArray, 3));
+    
+    const indexArray = new Uint32Array(currentFaces.length * 3);
+    currentFaces.forEach((face, i) => {
+      indexArray[i * 3] = face[0];
+      indexArray[i * 3 + 1] = face[1];
+      indexArray[i * 3 + 2] = face[2];
+    });
+    geometry.setIndex(new THREE.BufferAttribute(indexArray, 1));
+    
+    return geometry;
+  }
+}
+
+// ============================================================================
+// REACT COMPONENT WITH CLEAN STATE MANAGEMENT
+// ============================================================================
+
+const HexGlobeFramework = () => {
+  const containerRef = useRef(null);
+  const sceneRef = useRef(null);
+  const cameraRef = useRef(null);
+  const rendererRef = useRef(null);
+  const globeGroupRef = useRef(null);
+  const canvas2DRef = useRef(null);
+  const highlightHexRef = useRef(null); // Persistent red highlight hex
+  
+  // Settings state (inputs only)
+  const [subdivisions, setSubdivisions] = useState(3); // Default to 3 (works in Claude artifacts)
+  const [mapMode, setMapMode] = useState('terrain');
+  const [worldType, setWorldType] = useState('procedural');
+  const [heightmapFile, setHeightmapFile] = useState(null);
+  const [oceanMaskFile, setOceanMaskFile] = useState(null);
+  const [useOceanMask, setUseOceanMask] = useState(true); // Toggle for ocean mask
+  const [debugMode, setDebugMode] = useState(false);
+  const [selectedHex, setSelectedHex] = useState(null); // Track selected hex ID
+  const [viewMode, setViewMode] = useState('both'); // '3d', '2d', or 'both'
+  
+  // Camera controls
+  const [zoomLevel, setZoomLevel] = useState(2.5); // Camera distance (1.5 to 5)
+  
+  // Painting mode state
+  const [isPainting, setIsPainting] = useState(false);
+  const [paintTool, setPaintTool] = useState('brush'); // 'brush', 'line', 'fill'
+  const [brushValue, setBrushValue] = useState(0.5); // Elevation value to paint (0-1)
+  const [brushSize, setBrushSize] = useState(1); // Number of hex rings to paint
+  const [lineStart, setLineStart] = useState(null); // First click for line tool
+  
+  // Undo history (store grid snapshots)
+  const [undoHistory, setUndoHistory] = useState([]);
+  const maxUndoSteps = 20; // Limit history to prevent memory issues
+  
+  // Use refs to always get current values in callbacks
+  const brushValueRef = useRef(brushValue);
+  const brushSizeRef = useRef(brushSize);
+  const paintToolRef = useRef(paintTool);
+  const lineStartRef = useRef(lineStart);
+  useEffect(() => { brushValueRef.current = brushValue; }, [brushValue]);
+  useEffect(() => { brushSizeRef.current = brushSize; }, [brushSize]);
+  useEffect(() => { paintToolRef.current = paintTool; }, [paintTool]);
+  useEffect(() => { lineStartRef.current = lineStart; }, [lineStart]);
+  
+  // World state (the actual data)
+  const [grid, setGrid] = useState(null);
+  const [version, setVersion] = useState(0); // Force re-render trigger
+  
+  // UI state
+  const [isLoading, setIsLoading] = useState(false);
+  const [info, setInfo] = useState('');
+
+  // ============================================================================
+  // INITIALIZE THREE.JS SCENE (once, never changes)
+  // ============================================================================
+  useEffect(() => {
+    if (!containerRef.current) return;
+    
+    console.log('[Init] Setting up Three.js scene');
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x000510);
+    sceneRef.current = scene;
+    
+    const camera = new THREE.PerspectiveCamera(
+      60, 
+      containerRef.current.clientWidth / containerRef.current.clientHeight, 
+      0.1, 
+      1000
+    );
+    camera.position.z = zoomLevel;
+    cameraRef.current = camera;
+    
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(containerRef.current.clientWidth, containerRef.current.clientHeight);
+    containerRef.current.appendChild(renderer.domElement);
+    rendererRef.current = renderer;
+    
+    const globeGroup = new THREE.Group();
+    globeGroup.scale.x = -1; // Mirror the globe horizontally
+    scene.add(globeGroup);
+    globeGroupRef.current = globeGroup;
+    
+    scene.add(new THREE.AmbientLight(0xffffff, 0.8));
+    
+    // Poles
+    const poleGeo = new THREE.SphereGeometry(0.03, 16, 16);
+    const northPole = new THREE.Mesh(poleGeo, new THREE.MeshBasicMaterial({ color: 0xff0000 }));
+    northPole.position.set(0, 1.02, 0);
+    globeGroup.add(northPole);
+    
+    const southPole = new THREE.Mesh(poleGeo, new THREE.MeshBasicMaterial({ color: 0x0000ff }));
+    southPole.position.set(0, -1.02, 0);
+    globeGroup.add(southPole);
+    
+    // Create persistent highlight hex (hidden by default)
+    const highlightGeo = new THREE.SphereGeometry(0.04, 16, 16); // Smaller
+    const highlightMesh = new THREE.Mesh(
+      highlightGeo,
+      new THREE.MeshBasicMaterial({ 
+        color: 0xff0000, // Red
+        wireframe: false,
+        depthTest: true // Respect depth - hide behind globe
+      })
+    );
+    highlightMesh.visible = false; // Hidden until hex is selected
+    highlightMesh.renderOrder = 999; // Render last
+    globeGroup.add(highlightMesh);
+    highlightHexRef.current = highlightMesh;
+    console.log('[Init] Highlight sphere created');
+    
+    // Controls
+    let isDragging = false;
+    let hasDragged = false;
+    let prev = { x: 0, y: 0 };
+    
+    const onMouseDown = (e) => {
+      isDragging = true;
+      hasDragged = false;
+      prev = { x: e.clientX, y: e.clientY };
+    };
+    
+    const onMouseMove = (e) => {
+      if (isDragging) {
+        const dx = Math.abs(e.clientX - prev.x);
+        const dy = Math.abs(e.clientY - prev.y);
+        if (dx > 3 || dy > 3) hasDragged = true;
+        
+        globeGroup.rotation.y += (e.clientX - prev.x) * 0.005;
+        globeGroup.rotation.x += (e.clientY - prev.y) * 0.005;
+        prev = { x: e.clientX, y: e.clientY };
+      }
+    };
+    
+    const onMouseUp = () => { 
+      isDragging = false; 
+    };
+    
+    // Store click info for separate handler
+    renderer.domElement.dataset.hasDragged = 'false';
+    const updateDragState = () => {
+      renderer.domElement.dataset.hasDragged = hasDragged ? 'true' : 'false';
+    };
+    
+    renderer.domElement.style.cursor = 'pointer';
+    
+    const onWheel = (e) => {
+      e.preventDefault();
+      const newZoom = Math.max(1.5, Math.min(5, camera.position.z + e.deltaY * 0.001));
+      camera.position.z = newZoom;
+      setZoomLevel(newZoom); // Sync with state
+    };
+    
+    renderer.domElement.addEventListener('mousedown', onMouseDown);
+    renderer.domElement.addEventListener('mousemove', (e) => {
+      onMouseMove(e);
+      updateDragState();
+    });
+    renderer.domElement.addEventListener('mouseup', onMouseUp);
+    renderer.domElement.addEventListener('wheel', onWheel);
+    
+    // Keyboard controls for arrow keys
+    const onKeyDown = (e) => {
+      const rotationSpeed = 0.05;
+      switch(e.key) {
+        case 'ArrowLeft':
+          globeGroup.rotation.y -= rotationSpeed;
+          break;
+        case 'ArrowRight':
+          globeGroup.rotation.y += rotationSpeed;
+          break;
+        case 'ArrowUp':
+          globeGroup.rotation.x -= rotationSpeed;
+          break;
+        case 'ArrowDown':
+          globeGroup.rotation.x += rotationSpeed;
+          break;
+      }
+    };
+    
+    window.addEventListener('keydown', onKeyDown);
+    
+    const animate = () => {
+      requestAnimationFrame(animate);
+      // Auto-rotation disabled for easier painting
+      // if (!isDragging) globeGroup.rotation.y += 0.001;
+      renderer.render(scene, camera);
+    };
+    animate();
+    
+    console.log('[Init] Three.js scene ready');
+    
+    return () => {
+      renderer.domElement.removeEventListener('mousedown', onMouseDown);
+      renderer.domElement.removeEventListener('mousemove', onMouseMove);
+      renderer.domElement.removeEventListener('mouseup', onMouseUp);
+      renderer.domElement.removeEventListener('wheel', onWheel);
+      window.removeEventListener('keydown', onKeyDown);
+      renderer.dispose();
+      if (containerRef.current) {
+        containerRef.current.removeChild(renderer.domElement);
+      }
+    };
+  }, []); // Only run once
+
+  // ============================================================================
+  // SYNC ZOOM LEVEL WITH CAMERA
+  // ============================================================================
+  useEffect(() => {
+    if (cameraRef.current) {
+      cameraRef.current.position.z = zoomLevel;
+    }
+  }, [zoomLevel]);
+
+  // ============================================================================
+  // CREATE INITIAL GRID (only when subdivisions changes)
+  // ============================================================================
+  useEffect(() => {
+    console.log(`[Grid] Creating new grid with subdivisions=${subdivisions}`);
+    const newGrid = new HexGrid(subdivisions);
+    newGrid.generate();
+    setGrid(newGrid);
+    setInfo(`Grid created: ${newGrid.locations.size} hexes`);
+  }, [subdivisions]);
+
+  // ============================================================================
+  // UPDATE HIGHLIGHT HEX POSITION
+  // ============================================================================
+  useEffect(() => {
+    if (!grid || !highlightHexRef.current) return;
+    
+    if (selectedHex === null) {
+      // Hide highlight
+      highlightHexRef.current.visible = false;
+      return;
+    }
+    
+    const loc = grid.locations.get(selectedHex);
+    if (!loc) {
+      highlightHexRef.current.visible = false;
+      return;
+    }
+    
+    // Position highlight at selected hex location (scaled outward)
+    // loc.position is {x, y, z} plain object, convert to Vector3
+    const originalPos = new THREE.Vector3(loc.position.x, loc.position.y, loc.position.z);
+    const originalLength = originalPos.length();
+    
+    const pos = originalPos.clone();
+    pos.normalize().multiplyScalar(1.08); // Close to surface (8% beyond radius 1.0)
+    const finalLength = pos.length();
+    
+    highlightHexRef.current.position.copy(pos);
+    highlightHexRef.current.visible = true;
+    
+    // Calculate what 2D map shows for this hex
+    const lat = loc.getLatitude();
+    const lon = Math.atan2(loc.position.z, loc.position.x) * (180 / Math.PI);
+    const color = mapMode === 'terrain' ? TerrainGenerator.getTerrainColor(loc.terrain) : null;
+    
+    console.log(`[Highlight] Selected hex ${selectedHex}`);
+    console.log(`[Highlight] Terrain: ${loc.terrain}, Elevation: ${loc.elevation.toFixed(3)}`);
+    console.log(`[Highlight] Color: ${color}`);
+    console.log(`[Highlight] Lat/Lon: ${lat.toFixed(2)}°, ${lon.toFixed(2)}°`);
+    console.log(`[Highlight] Position length: ${originalLength.toFixed(3)} → ${finalLength.toFixed(3)}`);
+  }, [selectedHex, grid]);
+
+  // ============================================================================
+  // 3D GLOBE CLICK HANDLER (needs access to grid state)
+  // ============================================================================
+  useEffect(() => {
+    if (!grid || !rendererRef.current || !cameraRef.current || !globeGroupRef.current) return;
+    
+    const renderer = rendererRef.current;
+    const camera = cameraRef.current;
+    const globeGroup = globeGroupRef.current;
+    
+    const handleClick = (e) => {
+      // Check if user dragged (stored in dataset by drag handler)
+      if (renderer.domElement.dataset.hasDragged === 'true') return;
+      
+      // Raycast to find clicked hex
+      const rect = renderer.domElement.getBoundingClientRect();
+      const mouse = new THREE.Vector2(
+        ((e.clientX - rect.left) / rect.width) * 2 - 1,
+        -((e.clientY - rect.top) / rect.height) * 2 + 1
+      );
+      
+      const raycaster = new THREE.Raycaster();
+      raycaster.setFromCamera(mouse, camera);
+      
+      const intersects = raycaster.intersectObjects(globeGroup.children, true);
+      
+      if (intersects.length > 0) {
+        // Get the intersection point in world space
+        const worldPoint = intersects[0].point;
+        
+        // Transform to globe's local space (accounts for rotation)
+        const localPoint = globeGroup.worldToLocal(worldPoint.clone());
+        
+        // Find nearest vertex in grid
+        let nearestId = null;
+        let nearestDist = Infinity;
+        
+        grid.locations.forEach((loc, id) => {
+          const dist = Math.sqrt(
+            Math.pow(localPoint.x - loc.position.x, 2) +
+            Math.pow(localPoint.y - loc.position.y, 2) +
+            Math.pow(localPoint.z - loc.position.z, 2)
+          );
+          if (dist < nearestDist) {
+            nearestDist = dist;
+            nearestId = id;
+          }
+        });
+        
+        if (nearestId !== null) {
+          if (isPainting) {
+            paintHex(nearestId);
+          } else {
+            setSelectedHex(nearestId);
+            const loc = grid.locations.get(nearestId);
+            console.log(`[3D Click] Selected hex ${nearestId}: ${loc.terrain}, elevation: ${loc.elevation.toFixed(2)}`);
+          }
+        }
+      }
+    };
+    
+    renderer.domElement.addEventListener('click', handleClick);
+    
+    return () => {
+      renderer.domElement.removeEventListener('click', handleClick);
+    };
+  }, [grid, isPainting, paintHex]);
+
+  // ============================================================================
+  // GENERATE INITIAL WORLD (only once when grid is first created)
+  // ============================================================================
+  useEffect(() => {
+    if (!grid) return;
+    
+    // Only generate initial world if terrain hasn't been set yet
+    const hasNoTerrain = Array.from(grid.locations.values()).every(loc => loc.terrain === 'ocean' && loc.elevation === 0);
+    
+    if (hasNoTerrain) {
+      console.log('[Init] Loading default Earth heightmap from file');
+      setIsLoading(true);
+      
+      // Load Earth heightmap data URL from external file (to avoid context window issues)
+      fetch('earth_data_url.txt')
+        .then(res => res.text())
+        .then(dataUrl => {
+          // Convert data URL to blob
+          return fetch(dataUrl);
+        })
+        .then(res => res.blob())
+        .then(blob => {
+          const file = new File([blob], 'earth.jpg', { type: 'image/jpeg' });
+          return TerrainGenerator.loadFromHeightmap(grid, file, 0, false);
+        })
+        .then(() => {
+          ProvinceGenerator.generate(grid, 20, Date.now());
+          setVersion(v => v + 1);
+          setInfo(`Earth loaded: ${grid.locations.size} hexes, ${grid.provinces.size} provinces`);
+          setIsLoading(false);
+        })
+        .catch(err => {
+          console.error('[Init] Failed to load default Earth map:', err);
+          // Fallback to random terrain
+          TerrainGenerator.generateRandom(grid, Date.now());
+          ProvinceGenerator.generate(grid, 20, Date.now());
+          setVersion(v => v + 1);
+          setInfo(`Initial world: ${grid.locations.size} hexes, ${grid.provinces.size} provinces`);
+          setIsLoading(false);
+        });
+    }
+  }, [grid]);
+
+  // ============================================================================
+  // RENDER WORLD (when grid data or map mode changes)
+  // ============================================================================
+  useEffect(() => {
+    if (!grid || !globeGroupRef.current) return;
+    
+    console.log('[Render] Rendering world');
+    
+    // Clear previous hexes (keep poles at indices 0, 1 and highlight at index 2)
+    while (globeGroupRef.current.children.length > 3) {
+      const child = globeGroupRef.current.children[3];
+      globeGroupRef.current.remove(child);
+      child.geometry?.dispose();
+      child.material?.dispose();
+    }
+    
+    HexRenderer.renderHexagons(grid, globeGroupRef.current, mapMode);
+  }, [grid, mapMode, version]);
+
+  // ============================================================================
+  // RENDER 2D MAP (equirectangular projection)
+  // ============================================================================
+  useEffect(() => {
+    if (!grid || !canvas2DRef.current || (viewMode !== '2d' && viewMode !== 'both')) return;
+    
+    console.log('[Render] Generating 2D map');
+    const canvas = canvas2DRef.current;
+    const ctx = canvas.getContext('2d');
+    
+    const width = 1200;
+    const height = 600;
+    canvas.width = width;
+    canvas.height = height;
+    
+    // Clear canvas
+    ctx.fillStyle = '#000510';
+    ctx.fillRect(0, 0, width, height);
+    
+    // Create a grid to accumulate hex colors and IDs
+    const pixelData = new Array(width * height).fill(null);
+    const pixelHexIds = new Array(width * height).fill(null);
+    
+    grid.locations.forEach(loc => {
+      const lat = loc.getLatitude();
+      const lon = Math.atan2(loc.position.z, loc.position.x) * (180 / Math.PI);
+      
+      // Convert to pixel coordinates
+      const x = Math.floor(((lon + 180) / 360) * width);
+      const y = Math.floor(((90 - lat) / 180) * height);
+      
+      if (x >= 0 && x < width && y >= 0 && y < height) {
+        let color;
+        if (mapMode === 'terrain') {
+          color = TerrainGenerator.getTerrainColor(loc.terrain);
+        } else if (mapMode === 'political') {
+          const prov = loc.provinceId !== null ? grid.provinces.get(loc.provinceId) : null;
+          color = prov ? prov.color : '#1a4d7a';
+        } else {
+          const e = (loc.elevation + 0.5) / 1.5;
+          color = `rgb(${Math.floor(e*204)}, ${Math.floor(e*153)}, ${Math.floor(e*102)})`;
+        }
+        
+        // Highlight selected hex
+        if (selectedHex === loc.id) {
+          color = '#ff0000'; // Red highlight
+        }
+        
+        // Draw 5x5 pixel square for each hex (makes it much easier to click)
+        for (let dy = -2; dy <= 2; dy++) {
+          for (let dx = -2; dx <= 2; dx++) {
+            const px = x + dx;
+            const py = y + dy;
+            if (px >= 0 && px < width && py >= 0 && py < height) {
+              const pidx = py * width + px;
+              pixelData[pidx] = color;
+              pixelHexIds[pidx] = loc.id;
+            }
+          }
+        }
+      }
+    });
+    
+    // Draw all pixels (no longer need gap filling since we draw 5x5)
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const idx = y * width + x;
+        const color = pixelData[idx];
+        
+        if (color) {
+          ctx.fillStyle = color;
+          ctx.fillRect(x, y, 1, 1);
+        }
+      }
+    }
+    
+    // Draw grid lines
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.2)';
+    ctx.lineWidth = 1;
+    
+    // Latitude lines every 30°
+    for (let lat = -60; lat <= 60; lat += 30) {
+      const y = ((90 - lat) / 180) * height;
+      ctx.beginPath();
+      ctx.moveTo(0, y);
+      ctx.lineTo(width, y);
+      ctx.stroke();
+    }
+    
+    // Longitude lines every 30°
+    for (let lon = -180; lon < 180; lon += 30) {
+      const x = ((lon + 180) / 360) * width;
+      ctx.beginPath();
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x, height);
+      ctx.stroke();
+    }
+    
+    // Draw equator (thicker)
+    ctx.strokeStyle = 'rgba(255, 0, 0, 0.5)';
+    ctx.lineWidth = 2;
+    const equatorY = height / 2;
+    ctx.beginPath();
+    ctx.moveTo(0, equatorY);
+    ctx.lineTo(width, equatorY);
+    ctx.stroke();
+    
+    // Draw prime meridian (thicker)
+    ctx.strokeStyle = 'rgba(0, 255, 0, 0.5)';
+    const meridianX = width / 2;
+    ctx.beginPath();
+    ctx.moveTo(meridianX, 0);
+    ctx.lineTo(meridianX, height);
+    ctx.stroke();
+    
+    // Add click handler to 2D canvas
+    const handleCanvasClick = (e) => {
+      const rect = canvas.getBoundingClientRect();
+      const scaleX = canvas.width / rect.width;
+      const scaleY = canvas.height / rect.height;
+      const x = Math.floor((e.clientX - rect.left) * scaleX);
+      const y = Math.floor((e.clientY - rect.top) * scaleY);
+      
+      if (x >= 0 && x < width && y >= 0 && y < height) {
+        const hexId = pixelHexIds[y * width + x];
+        if (hexId !== null) {
+          if (isPainting) {
+            paintHex(hexId);
+          } else {
+            setSelectedHex(hexId);
+            const loc = grid.locations.get(hexId);
+            if (loc) {
+              console.log(`[2D Click] Selected hex ${hexId}: ${loc.terrain}, elevation: ${loc.elevation.toFixed(2)}`);
+            }
+          }
+        }
+      }
+    };
+    
+    canvas.addEventListener('click', handleCanvasClick);
+    
+    console.log('[Render] 2D map complete');
+    
+    return () => {
+      canvas.removeEventListener('click', handleCanvasClick);
+    };
+  }, [grid, mapMode, version, viewMode, selectedHex, isPainting, paintHex]);
+
+  // ============================================================================
+  // PAINTING FUNCTIONALITY
+  // ============================================================================
+  
+  // Helper: Paint a single hex with current brush value
+  const paintSingleHex = useCallback((hex, value) => {
+    hex.elevation = value;
+    if (value < 0.1) {
+      hex.terrain = 'ocean';
+    } else if (value > 0.7) {
+      hex.terrain = 'mountains';
+    } else if (value > 0.5) {
+      hex.terrain = 'hills';
+    } else {
+      hex.terrain = 'plains';
+    }
+  }, []);
+
+  // Brush tool: Paint hex + neighbors in radius
+  const paintBrush = useCallback((hexId, value, size) => {
+    if (!grid) return new Set();
+    
+    const painted = new Set();
+    const toPaint = [hexId];
+    
+    for (let ring = 0; ring < size; ring++) {
+      const currentRing = [...toPaint];
+      toPaint.length = 0;
+      
+      for (const id of currentRing) {
+        if (painted.has(id)) continue;
+        painted.add(id);
+        
+        const hex = grid.locations.get(id);
+        if (hex) {
+          paintSingleHex(hex, value);
+          
+          if (ring < size - 1) {
+            hex.neighbors.forEach(nId => {
+              if (!painted.has(nId)) toPaint.push(nId);
+            });
+          }
+        }
+      }
+    }
+    
+    return painted;
+  }, [grid, paintSingleHex]);
+
+  // Line tool: Paint straight line between two hexes
+  const paintLine = useCallback((startId, endId, value) => {
+    if (!grid) return new Set();
+    
+    const painted = new Set();
+    const start = grid.locations.get(startId);
+    const end = grid.locations.get(endId);
+    
+    if (!start || !end) return painted;
+    
+    // Use Bresenham-like algorithm in 3D space
+    const startPos = start.position;
+    const endPos = end.position;
+    const distance = Math.sqrt(
+      Math.pow(endPos.x - startPos.x, 2) +
+      Math.pow(endPos.y - startPos.y, 2) +
+      Math.pow(endPos.z - startPos.z, 2)
+    );
+    
+    // Sample points along the line
+    const steps = Math.ceil(distance * 1000); // Fine-grained sampling
+    
+    for (let i = 0; i <= steps; i++) {
+      const t = i / steps;
+      const x = startPos.x + (endPos.x - startPos.x) * t;
+      const y = startPos.y + (endPos.y - startPos.y) * t;
+      const z = startPos.z + (endPos.z - startPos.z) * t;
+      
+      // Find nearest hex to this point
+      let nearestId = null;
+      let nearestDist = Infinity;
+      
+      grid.locations.forEach((loc, id) => {
+        const dist = Math.sqrt(
+          Math.pow(x - loc.position.x, 2) +
+          Math.pow(y - loc.position.y, 2) +
+          Math.pow(z - loc.position.z, 2)
+        );
+        if (dist < nearestDist) {
+          nearestDist = dist;
+          nearestId = id;
+        }
+      });
+      
+      if (nearestId !== null && !painted.has(nearestId)) {
+        painted.add(nearestId);
+        const hex = grid.locations.get(nearestId);
+        if (hex) paintSingleHex(hex, value);
+      }
+    }
+    
+    return painted;
+  }, [grid, paintSingleHex]);
+
+  // Fill tool: Flood fill connected hexes
+  const paintFill = useCallback((startId, value) => {
+    if (!grid) return new Set();
+    
+    const painted = new Set();
+    const startHex = grid.locations.get(startId);
+    if (!startHex) return painted;
+    
+    const targetTerrain = startHex.terrain;
+    const toFill = [startId];
+    
+    while (toFill.length > 0) {
+      const id = toFill.pop();
+      if (painted.has(id)) continue;
+      
+      const hex = grid.locations.get(id);
+      if (!hex || hex.terrain !== targetTerrain) continue;
+      
+      painted.add(id);
+      paintSingleHex(hex, value);
+      
+      // Add neighbors of same terrain
+      hex.neighbors.forEach(nId => {
+        if (!painted.has(nId)) {
+          const neighbor = grid.locations.get(nId);
+          if (neighbor && neighbor.terrain === targetTerrain) {
+            toFill.push(nId);
+          }
+        }
+      });
+    }
+    
+    return painted;
+  }, [grid, paintSingleHex]);
+
+  const paintHex = useCallback((hexId) => {
+    if (!grid || !isPainting) return;
+    
+    const currentTool = paintToolRef.current;
+    const currentBrushValue = brushValueRef.current;
+    const currentBrushSize = brushSizeRef.current;
+    const currentLineStart = lineStartRef.current;
+    
+    // Handle line tool (requires two clicks)
+    if (currentTool === 'line') {
+      if (currentLineStart === null) {
+        // First click - store start point
+        setLineStart(hexId);
+        console.log(`[Line] Start point set: ${hexId}`);
+        return;
+      } else {
+        // Second click - draw line
+        console.log(`[Line] Drawing from ${currentLineStart} to ${hexId}`);
+        
+        // Save state before painting
+        const snapshot = new Map();
+        grid.locations.forEach((loc, id) => {
+          snapshot.set(id, { elevation: loc.elevation, terrain: loc.terrain });
+        });
+        setUndoHistory(prev => {
+          const newHistory = [...prev, snapshot];
+          if (newHistory.length > maxUndoSteps) newHistory.shift();
+          return newHistory;
+        });
+        
+        // Paint line
+        const painted = paintLine(currentLineStart, hexId, currentBrushValue);
+        
+        // Reset line start
+        setLineStart(null);
+        setVersion(v => v + 1);
+        console.log(`[Line] Painted ${painted.size} hexes`);
+        return;
+      }
+    }
+    
+    // Save state for brush and fill tools
+    const snapshot = new Map();
+    grid.locations.forEach((loc, id) => {
+      snapshot.set(id, { elevation: loc.elevation, terrain: loc.terrain });
+    });
+    setUndoHistory(prev => {
+      const newHistory = [...prev, snapshot];
+      if (newHistory.length > maxUndoSteps) newHistory.shift();
+      return newHistory;
+    });
+    
+    // Execute the selected tool
+    let painted;
+    if (currentTool === 'brush') {
+      painted = paintBrush(hexId, currentBrushValue, currentBrushSize);
+    } else if (currentTool === 'fill') {
+      painted = paintFill(hexId, currentBrushValue);
+    }
+    
+    // Force re-render
+    setVersion(v => v + 1);
+    console.log(`[${currentTool}] Painted ${painted.size} hexes with value ${currentBrushValue}`);
+  }, [grid, isPainting, maxUndoSteps, paintBrush, paintLine, paintFill]);
+
+  // ============================================================================
+  // UNDO FUNCTIONALITY
+  // ============================================================================
+  const handleUndo = useCallback(() => {
+    if (!grid || undoHistory.length === 0) return;
+    
+    // Pop the last snapshot from history
+    const lastSnapshot = undoHistory[undoHistory.length - 1];
+    setUndoHistory(prev => prev.slice(0, -1));
+    
+    // Restore the snapshot
+    lastSnapshot.forEach((data, hexId) => {
+      const hex = grid.locations.get(hexId);
+      if (hex) {
+        hex.elevation = data.elevation;
+        hex.terrain = data.terrain;
+      }
+    });
+    
+    // Force re-render
+    setVersion(v => v + 1);
+    console.log(`[Undo] Restored state, ${undoHistory.length - 1} steps remaining`);
+  }, [grid, undoHistory]);
+
+  // ============================================================================
+  // RECENTER CAMERA
+  // ============================================================================
+  const handleRecenter = useCallback(() => {
+    if (globeGroupRef.current) {
+      globeGroupRef.current.rotation.x = 0;
+      globeGroupRef.current.rotation.y = 0;
+      globeGroupRef.current.rotation.z = 0;
+      setZoomLevel(2.5); // Reset to default zoom
+      console.log('[Camera] Recentered globe and reset zoom');
+    }
+  }, []);
+
+  // ============================================================================
+  // REGENERATE WORLD (explicit user action)
+  // ============================================================================
+  const handleRegenerate = useCallback(async () => {
+    if (!grid) return;
+    
+    console.log('[Action] Regenerating world');
+    setIsLoading(true);
+    
+    try {
+      // Clone grid to avoid mutating state directly
+      const newGrid = grid.clone();
+      
+      if (worldType === 'blank') {
+        // Blank canvas - set all hexes to 0.5 elevation, plains terrain
+        newGrid.locations.forEach(loc => {
+          loc.elevation = 0.5;
+          loc.terrain = 'plains';
+        });
+        console.log('[Blank] Created blank canvas');
+      } else if (worldType === 'earth' && heightmapFile) {
+        // Load ocean mask first if provided AND enabled
+        if (oceanMaskFile && useOceanMask) {
+          await TerrainGenerator.loadOceanMask(newGrid, oceanMaskFile);
+        } else if (oceanMaskFile && !useOceanMask) {
+          console.log('[Ocean] Ocean mask disabled, using elevation threshold');
+        }
+        // Then load elevation heightmap
+        await TerrainGenerator.loadFromHeightmap(newGrid, heightmapFile, 0, debugMode);
+      } else {
+        TerrainGenerator.generateRandom(newGrid, Date.now());
+      }
+      
+      ProvinceGenerator.generate(newGrid, 20, Date.now());
+      
+      // Update state with new grid
+      setGrid(newGrid);
+      setInfo(`Regenerated: ${newGrid.locations.size} hexes, ${newGrid.provinces.size} provinces`);
+    } catch (err) {
+      console.error('[Error] Regeneration failed:', err);
+      setInfo('Failed to regenerate terrain');
+    }
+    
+    setIsLoading(false);
+  }, [grid, worldType, heightmapFile, oceanMaskFile, useOceanMask, debugMode]);
+
+  // ============================================================================
+  // LOAD EARTH MAP FROM PROJECT FILE
+  // ============================================================================
+  const handleLoadEarthMap = useCallback(async () => {
+    if (!grid) return;
+    
+    console.log('[Action] Loading Earth heightmap from file');
+    setIsLoading(true);
+    
+    try {
+      // Load Earth heightmap data URL from file in same directory as artifact
+      // Note: This file needs to be in the same location as the .jsx file
+      const response = await fetch('./earth_data_url.txt');
+      if (!response.ok) {
+        throw new Error(`Failed to fetch: ${response.status} ${response.statusText}`);
+      }
+      const dataUrl = await response.text();
+      
+      // Convert data URL to blob
+      const blobResponse = await fetch(dataUrl);
+      const blob = await blobResponse.blob();
+      const file = new File([blob], 'earth.jpg', { type: 'image/jpeg' });
+      
+      // Clone grid and load terrain
+      const newGrid = grid.clone();
+      await TerrainGenerator.loadFromHeightmap(newGrid, file, 0, debugMode);
+      ProvinceGenerator.generate(newGrid, 20, Date.now());
+      
+      setGrid(newGrid);
+      setInfo(`Earth loaded: ${newGrid.locations.size} hexes, ${newGrid.provinces.size} provinces`);
+    } catch (err) {
+      console.error('[Error] Failed to load Earth map:', err);
+      setInfo(`Failed to load Earth map: ${err.message}`);
+    }
+    
+    setIsLoading(false);
+  }, [grid, debugMode]);
+
+  // ============================================================================
+  // SET SEA LEVEL FOR 71% OCEAN COVERAGE
+  // ============================================================================
+  const handleSet71PercentOcean = useCallback(() => {
+    if (!grid) return;
+    
+    console.log('[Action] Calculating sea level for 71% ocean coverage');
+    
+    // Collect all elevation values
+    const elevations = Array.from(grid.locations.values()).map(loc => loc.elevation);
+    elevations.sort((a, b) => a - b);
+    
+    // Find elevation at 71st percentile
+    const targetIndex = Math.floor(elevations.length * 0.71);
+    const newSeaLevel = elevations[targetIndex];
+    
+    setSeaLevel(newSeaLevel);
+    setInfo(`Sea level set to ${newSeaLevel.toFixed(3)} for 71% ocean coverage`);
+    console.log(`[Action] New sea level: ${newSeaLevel.toFixed(3)}`);
+  }, [grid]);
+
+  return (
+    <div className="w-full h-screen bg-gray-900 flex flex-col">
+      <div className="bg-gray-800 border-b border-gray-700 p-4">
+        <h1 className="text-2xl font-bold text-white mb-4">Hex Globe Framework v3.0 - Ultra-Optimized Hexagons</h1>
+        
+        {/* Row 1: Grid Settings */}
+        <div className="flex gap-4 items-center flex-wrap mb-3">
+          <div className="flex items-center gap-2">
+            <label className="text-gray-300 text-sm">Detail:</label>
+            <input 
+              type="range" 
+              min="2" 
+              max="8" 
+              value={subdivisions} 
+              onChange={(e) => setSubdivisions(parseInt(e.target.value))} 
+              className="w-32" 
+              disabled={isLoading} 
+            />
+            <span className="text-white font-mono">{subdivisions}</span>
+            <span className="text-gray-400 text-xs">
+              ({(10 * Math.pow(4, subdivisions) + 2).toLocaleString()} hexes)
+              {subdivisions >= 8 && <span className="text-red-400 ml-1 font-bold">⚠ May not work in browser</span>}
+              {subdivisions >= 6 && subdivisions < 8 && <span className="text-orange-400 ml-1">⚠ Slow</span>}
+            </span>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <label className="text-gray-300 text-sm">World:</label>
+            <select 
+              value={worldType} 
+              onChange={(e) => setWorldType(e.target.value)}
+              className="px-3 py-1 bg-gray-700 text-white rounded text-sm" 
+              disabled={isLoading}
+            >
+              <option value="procedural">Procedural</option>
+              <option value="blank">Blank Canvas</option>
+              <option value="earth">Earth</option>
+            </select>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <label className="text-gray-300 text-sm">View:</label>
+            <select 
+              value={mapMode} 
+              onChange={(e) => setMapMode(e.target.value)}
+              className="px-3 py-1 bg-gray-700 text-white rounded text-sm" 
+              disabled={isLoading}
+            >
+              <option value="terrain">Terrain</option>
+              <option value="political">Political</option>
+              <option value="elevation">Elevation</option>
+            </select>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <label className="text-gray-300 text-sm">Display:</label>
+            <select 
+              value={viewMode} 
+              onChange={(e) => setViewMode(e.target.value)}
+              className="px-3 py-1 bg-gray-700 text-white rounded text-sm" 
+              disabled={isLoading}
+            >
+              <option value="both">Side by Side</option>
+              <option value="3d">3D Globe Only</option>
+              <option value="2d">2D Map Only</option>
+            </select>
+          </div>
+          
+          <button 
+            onClick={handleRegenerate} 
+            disabled={isLoading}
+            className="px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded text-sm disabled:opacity-50"
+          >
+            {isLoading ? 'Loading...' : 'Regenerate Terrain'}
+          </button>
+          
+          <span className="text-gray-400 text-sm ml-auto">{info}</span>
+        </div>
+        
+        {/* Row 2: Paint Tools */}
+        <div className="flex gap-4 items-center flex-wrap mb-3">
+          <button 
+            onClick={() => setIsPainting(!isPainting)} 
+            disabled={isLoading}
+            className={`px-4 py-2 rounded text-sm disabled:opacity-50 ${
+              isPainting 
+                ? 'bg-orange-600 hover:bg-orange-700 text-white font-bold' 
+                : 'bg-gray-600 hover:bg-gray-700 text-white'
+            }`}
+          >
+            {isPainting ? '🖌️ Painting' : 'Paint Mode'}
+          </button>
+          
+          <button 
+            onClick={handleUndo} 
+            disabled={isLoading || undoHistory.length === 0}
+            className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded text-sm disabled:opacity-50"
+            title={`Undo (${undoHistory.length} steps available)`}
+          >
+            ↶ Undo
+          </button>
+          
+          {isPainting && (
+            <>
+              <div className="flex items-center gap-2">
+                <label className="text-gray-300 text-sm">Tool:</label>
+                <select 
+                  value={paintTool} 
+                  onChange={(e) => {
+                    setPaintTool(e.target.value);
+                    setLineStart(null); // Reset line start when changing tools
+                  }}
+                  className="px-3 py-1 bg-gray-700 text-white rounded text-sm"
+                >
+                  <option value="brush">🖌️ Brush</option>
+                  <option value="line">📏 Line</option>
+                  <option value="fill">🪣 Fill</option>
+                </select>
+              </div>
+              
+              {lineStart !== null && (
+                <span className="text-yellow-400 text-sm">
+                  📍 Click second point for line
+                </span>
+              )}
+              
+              <div className="flex items-center gap-2">
+                <label className="text-gray-300 text-sm">Value:</label>
+                <input 
+                  type="range" 
+                  min="0" 
+                  max="1" 
+                  step="0.05" 
+                  value={brushValue}
+                  onChange={(e) => setBrushValue(parseFloat(e.target.value))} 
+                  className="w-24" 
+                />
+                <span className="text-white font-mono text-sm">{brushValue.toFixed(2)}</span>
+              </div>
+              
+              {paintTool === 'brush' && (
+                <div className="flex items-center gap-2">
+                  <label className="text-gray-300 text-sm">Size:</label>
+                  <input 
+                    type="range" 
+                    min="1" 
+                    max="5" 
+                    value={brushSize}
+                    onChange={(e) => setBrushSize(parseInt(e.target.value))} 
+                    className="w-20" 
+                  />
+                  <span className="text-white font-mono text-sm">{brushSize}</span>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+        
+        {/* Row 3: Camera Controls */}
+        <div className="flex gap-4 items-center flex-wrap">
+          <div className="flex items-center gap-2">
+            <label className="text-gray-300 text-sm">Zoom:</label>
+            <input 
+              type="range" 
+              min="1.5" 
+              max="5" 
+              step="0.1" 
+              value={zoomLevel}
+              onChange={(e) => setZoomLevel(parseFloat(e.target.value))} 
+              className="w-24" 
+              disabled={isLoading}
+            />
+            <span className="text-white font-mono text-xs">{zoomLevel.toFixed(1)}</span>
+          </div>
+          
+          <button 
+            onClick={handleRecenter} 
+            disabled={isLoading}
+            className="px-3 py-1 bg-gray-600 hover:bg-gray-700 text-white rounded text-sm disabled:opacity-50"
+            title="Reset globe rotation and zoom (Arrow keys to rotate)"
+          >
+            ⟲ Recenter
+          </button>
+        </div>
+        
+        {worldType === 'earth' && (
+          <div className="space-y-2 text-sm bg-gray-750 p-3 rounded">
+            <div className="flex items-center gap-2">
+              <label className="text-gray-300 min-w-32">Elevation Heightmap:</label>
+              <input 
+                type="file" 
+                accept="image/*" 
+                onChange={(e) => setHeightmapFile(e.target.files[0])}
+                className="text-gray-300" 
+                disabled={isLoading} 
+              />
+              {heightmapFile && <span className="text-green-400">✓ {heightmapFile.name}</span>}
+            </div>
+            <div className="flex items-center gap-2">
+              <label className="text-gray-300 min-w-32">Ocean Mask (optional):</label>
+              <input 
+                type="file" 
+                accept="image/*" 
+                onChange={(e) => setOceanMaskFile(e.target.files[0])}
+                className="text-gray-300" 
+                disabled={isLoading} 
+              />
+              {oceanMaskFile && <span className="text-green-400">✓ {oceanMaskFile.name}</span>}
+            </div>
+            {oceanMaskFile && (
+              <label className="text-gray-300 flex items-center">
+                <input 
+                  type="checkbox" 
+                  checked={useOceanMask} 
+                  onChange={(e) => setUseOceanMask(e.target.checked)}
+                  disabled={isLoading} 
+                  className="mr-2" 
+                />
+                Use Ocean Mask (toggle to see difference)
+              </label>
+            )}
+            <label className="text-gray-300">
+              <input 
+                type="checkbox" 
+                checked={debugMode} 
+                onChange={(e) => setDebugMode(e.target.checked)}
+                disabled={isLoading} 
+                className="mr-2" 
+              />
+              Debug Mode (simple ocean/land)
+            </label>
+            <p className="text-gray-500 text-xs">
+              💡 Ocean mask: White = ocean (0.0), Any color = land (0.1-1.0). Toggle to compare!
+            </p>
+          </div>
+        )}
+        
+        <div className="mt-3 text-gray-400 text-xs">
+          <strong>Controls:</strong> Drag to rotate • Scroll to zoom • <strong>Poles:</strong> Red = North, Blue = South
+          <br/>
+          <strong>Ultra-Optimized:</strong> Vertex-centered hexagons • Massive batching • No edges • Up to 15 subdivisions
+        </div>
+      </div>
+      
+      <div className="flex-1 flex gap-2 p-2">
+        <div 
+          ref={containerRef} 
+          className={viewMode === 'both' ? 'flex-1' : viewMode === '3d' ? 'w-full h-full' : 'hidden'}
+          style={{ position: 'relative', display: viewMode === '2d' ? 'none' : 'block' }}
+        />
+        
+        <div 
+          className={`${viewMode === 'both' ? 'flex-1' : viewMode === '2d' ? 'w-full h-full' : 'hidden'} overflow-auto bg-gray-900 flex items-center justify-center`}
+          style={{ display: viewMode === '3d' ? 'none' : 'flex' }}
+        >
+          <canvas 
+            ref={canvas2DRef} 
+            className="border border-gray-700 shadow-lg cursor-crosshair"
+            style={{ maxWidth: '100%', maxHeight: '100%' }}
+          />
+        </div>
+      </div>
+      
+      <div className="bg-gray-800 border-t border-gray-700 p-3 text-gray-400 text-xs">
+        <strong>v3.0 Ultra-Optimized:</strong> Vertex-centered hexagons • Massive batching • TypedArrays • Up to 15 subdivisions
+        {selectedHex !== null && <span className="ml-4 text-red-400">• Selected Hex: {selectedHex}</span>}
+      </div>
+    </div>
+  );
+};
+
+
+function waitForDependencies() {
+    return new Promise((resolve) => {
+        let attempts = 0;
+        const maxAttempts = 100;
+        
+        const checkInterval = setInterval(() => {
+            attempts++;
+            
+            if (typeof THREE !== 'undefined' && 
+                typeof React !== 'undefined' && 
+                typeof ReactDOM !== 'undefined') {
+                console.log('[Init] All dependencies loaded!');
+                clearInterval(checkInterval);
+                resolve();
+            } else if (attempts >= maxAttempts) {
+                console.error('[FAILED] Could not load dependencies');
+                clearInterval(checkInterval);
+            }
+        }, 100);
+    });
+}
+
+waitForDependencies().then(() => {
+    const container = document.getElementById('root');
+    const root = ReactDOM.createRoot(container);
+    root.render(React.createElement(HexGlobeFramework));
+});
+    </script>
+</body>
+</html>
